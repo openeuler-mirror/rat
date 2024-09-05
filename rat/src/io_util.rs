@@ -65,11 +65,10 @@ impl<W: Write> BufferedWriter<W> {
         self.buffer.push(byte);
         Ok(())
     }
-    
+
     /// Flush the buffer to the writer
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.buffer.is_empty() {
-            // eprint!("flushing buffer: {}\n", self.buffer.len());
             self.writer.write_all(&self.buffer)?;
             self.buffer.clear();
         }

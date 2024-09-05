@@ -548,7 +548,7 @@ fn easy_write_multi_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> 
         Ok(())
     });
 
-    let w_bp = buffer_pool.clone();
+    let w_bp = buffer_pool;
     let w_handle = thread::spawn(move || -> Result<(), Error> {
         let mut writer = BufferedWriter::new(io::stdout());
         let buffers = unsafe { &mut *w_bp.buffers.get() };
@@ -761,7 +761,7 @@ fn real_write(
                 state.pre_carriage_return = false;
                 state.new_line = false;
             }
-            if state.new_line && (config.number_mode != NumberMode::None) {
+            if state.new_line && config.number_mode != NumberMode::None {
                 // print line number
                 state.line_number.next_line_num();
                 writer.write(state.line_number.get_line_num())?;
@@ -794,13 +794,18 @@ fn real_write(
             if offset + len == byte_read {
                 break;
             }
-            if buffer[offset + len] == b'\n' {
-                write_end(&mut writer, config, state)?;
-                state.has_blank_line = state.new_line;
-                state.new_line = true;
-            } else if buffer[offset + len] == b'\r' {
-                state.pre_carriage_return = true;
-                state.new_line = false;
+
+            match buffer[offset + len] {
+                b'\n' => {
+                    write_end(&mut writer, config, state)?;
+                    state.has_blank_line = state.new_line;
+                    state.new_line = true;
+                }
+                b'\r' => {
+                    state.pre_carriage_return = true;
+                    state.new_line = false;
+                }
+                _ => {}
             }
 
             offset += len + 1;
