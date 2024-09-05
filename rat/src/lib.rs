@@ -4,13 +4,16 @@
 // For the full copyright and license information, please view the LICENSE file
 // that was distributed with this source code.
 
-mod ioblksize;
+mod io_util;
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command, Error};
-use ioblksize::io_blksize;
+use io_util::{io_blksize, BufferedWriter};
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc::{lseek, O_APPEND, SEEK_CUR};
 use nix::sys::stat::fstat;
+use std::cell::UnsafeCell;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
+use std::thread;
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -18,6 +21,10 @@ use std::{
 };
 
 const ABOUT: &str = "rat - concatenate files and print on the standard output";
+
+const LINE_COUNTER_BUF_LEN: usize = 20;
+
+const BUFFER_POOL_SIZE: usize = 10;
 
 #[derive(PartialEq, Eq)]
 /// Enum representing the mode for numbering lines
@@ -259,17 +266,72 @@ fn get_input_type(filename: &str) -> InputType {
     }
 }
 
+struct LineNumber {
+    line_buf: Vec<u8>,
+    line_num_start: usize,
+    line_num_end: usize,
+    line_num_print: usize,
+}
+
+impl LineNumber {
+    fn new(size: usize) -> Self {
+        let mut line_buf = vec![b' '; size];
+        let line_num_end = size - 1;
+        let line_num_start = line_num_end;
+        let line_num_print = line_num_end - 5;
+        line_buf[line_num_end] = b'0';
+        LineNumber {
+            line_buf,
+            line_num_start,
+            line_num_end,
+            line_num_print,
+        }
+    }
+
+    fn next_line_num(&mut self) {
+        let mut endp = self.line_num_end;
+        loop {
+            if self.line_buf[endp] < b'9' {
+                self.line_buf[endp] += 1;
+                return;
+            }
+            self.line_buf[endp] = b'0';
+            if endp == self.line_num_start {
+                break;
+            }
+            endp -= 1;
+        }
+
+        if self.line_num_start > 0 {
+            self.line_num_start -= 1;
+            self.line_buf[self.line_num_start] = b'1';
+        } else {
+            self.line_buf[0] = b'>';
+        }
+
+        if self.line_num_start < self.line_num_print {
+            self.line_num_print -= 1;
+        }
+    }
+
+    fn get_line_num(&self) -> &[u8] {
+        &self.line_buf[self.line_num_print..=self.line_num_end]
+    }
+}
+
 /// Struct representing the state of the output
 struct OutState {
-    line: i32,
+    // line: i32,
     new_line: bool,
     has_blank_line: bool,
     pre_carriage_return: bool,
+    // blank_lines: i32,
+    line_number: LineNumber,
 }
 
 /// Handles the input and processes it based on the configuration
 fn rat_handle(
-    reader: Box<dyn Read>,
+    reader: Box<dyn Read + Send>,
     state: &mut OutState,
     config: &Config,
     bufsize: usize,
@@ -283,7 +345,7 @@ fn rat_handle(
 }
 
 struct InputState {
-    reader: Box<dyn Read>,
+    reader: Box<dyn Read + Send>,
     bufsize: usize,
 }
 
@@ -296,7 +358,7 @@ fn open_file(file: &str) -> Option<InputState> {
     match get_input_type(file) {
         InputType::Stdin => Some(InputState {
             reader: Box::new(io::stdin()),
-            bufsize: 4096,
+            bufsize: 10240,
         }),
         InputType::File => {
             if !Path::new(file).exists() {
@@ -348,10 +410,12 @@ fn open_file(file: &str) -> Option<InputState> {
 pub fn rat_process(config: &Config) -> i32 {
     let mut exit_status = 0;
     let mut out_state = OutState {
-        line: 1,
+        // line: 1,
         new_line: true,
         has_blank_line: false,
         pre_carriage_return: false,
+        // blank_lines: 0,
+        line_number: LineNumber::new(LINE_COUNTER_BUF_LEN),
     };
 
     for file in &config.files {
@@ -371,20 +435,291 @@ pub fn rat_process(config: &Config) -> i32 {
     exit_status
 }
 
-/// Writes the input directly to the output
-fn easy_write(mut reader: Box<dyn Read>, bufsize: usize) -> Result<(), Error> {
-    let mut stdout = io::stdout();
+/// Writes the input directly to the output using a single thread
+fn easy_write_single_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
+    let mut writer = BufferedWriter::new(io::stdout());
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        stdout.write_all(&buffer[..bytes_read])?;
+        writer.write(&buffer[..bytes_read])?;
     }
     Ok(())
 }
+
+#[derive(Clone)]
+struct Buffer {
+    buffer: Vec<u8>,
+    size: usize,
+}
+
+impl Buffer {
+    fn new(size: usize) -> Self {
+        Buffer {
+            buffer: vec![0; size],
+            size: 0,
+        }
+    }
+}
+
+///
+struct BufferPoolState {
+    head: usize,
+    tail: usize,
+    finish: bool,
+}
+
+impl BufferPoolState {
+    fn new() -> Self {
+        BufferPoolState {
+            head: 0,
+            tail: 0,
+            finish: false,
+        }
+    }
+
+    fn next_head(&mut self) {
+        self.head = (self.head + 1) % BUFFER_POOL_SIZE;
+    }
+
+    fn next_tail(&mut self) {
+        self.tail = (self.tail + 1) % BUFFER_POOL_SIZE;
+    }
+
+    fn is_full(&self) -> bool {
+        (self.head + 1) % BUFFER_POOL_SIZE == self.tail
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+
+    fn set_finish(&mut self) {
+        self.finish = true;
+    }
+
+    fn is_finish(&self) -> bool {
+        self.finish
+    }
+
+    fn get_head(&self) -> usize {
+        self.head
+    }
+    fn get_tail(&self) -> usize {
+        self.tail
+    }
+}
+
+///
+struct BufferPool {
+    buffers: UnsafeCell<Vec<Buffer>>,
+    state: UnsafeCell<BufferPoolState>,
+}
+
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
+
+/// Writes the input directly to the output using multiple threads
+fn easy_write_multi_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
+    let buffer_pool = Arc::new(BufferPool {
+        buffers: UnsafeCell::new(vec![Buffer::new(bufsize); BUFFER_POOL_SIZE]),
+        state: UnsafeCell::new(BufferPoolState::new()),
+    });
+
+    let r_bp = buffer_pool.clone();
+    let r_handle = thread::spawn(move || -> Result<(), Error> {
+        let buffers = unsafe { &mut *r_bp.buffers.get() };
+        let r_state = unsafe { &mut *r_bp.state.get() };
+        loop {
+            while r_state.is_full() {
+                thread::yield_now();
+            }
+            let bytes_read = reader.read(&mut buffers[r_state.get_head()].buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            buffers[r_state.get_head()].size = bytes_read;
+            r_state.next_head();
+        }
+        r_state.set_finish();
+        Ok(())
+    });
+
+    let w_bp = buffer_pool.clone();
+    let w_handle = thread::spawn(move || -> Result<(), Error> {
+        let mut writer = BufferedWriter::new(io::stdout());
+        let buffers = unsafe { &mut *w_bp.buffers.get() };
+        let w_state = unsafe { &mut *w_bp.state.get() };
+
+        loop {
+            while w_state.is_empty() {
+                if w_state.is_finish() {
+                    return Ok(());
+                }
+                thread::yield_now();
+            }
+            let tb = &buffers[w_state.get_tail()];
+            writer.write_immediately(&tb.buffer[0..tb.size])?;
+            w_state.next_tail();
+        }
+    });
+
+    r_handle.join().unwrap().unwrap();
+    w_handle.join().unwrap().unwrap();
+    Ok(())
+}
+
+/// Writes the input directly to the output
+fn easy_write(reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
+    let available_cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if available_cores == 1 {
+        easy_write_single_thread(reader, bufsize)
+    } else {
+        easy_write_multi_thread(reader, bufsize)
+    }
+}
+
+// fn real_write(
+//     mut reader: Box<dyn Read>,
+//     config: &Config,
+//     state: &mut OutState,
+//     bufsize: usize,
+// ) -> Result<(), Error> {
+//     let mut buffer: Vec<u8> = vec![0; bufsize];
+//     let mut writer = BufferedWriter::new(io::stdout());
+//     let mut inloc = 1;
+//     let mut insize = 0;
+//     let mut ch: u8 = 0;
+//     loop {
+//         loop {
+//             if inloc > insize {
+//                 insize = reader.read(&mut buffer)?;
+//                 if insize == 0 {
+//                     writer.flush()?;
+//                     return Ok(()); // EOF
+//                 }
+//                 inloc = 0;
+//             } else {
+//                 state.blank_lines += 1;
+//                 if state.blank_lines > 0 {
+//                     if state.blank_lines >= 2 {
+//                         state.blank_lines = 2;
+//                         if config.squeeze_blank {
+//                             if inloc == insize {
+//                                 inloc += 1;
+//                                 ch = b'\n';
+//                                 continue;
+//                             }
+//                             ch = buffer[inloc];
+//                             inloc += 1;
+//                             if ch != b'\n' {
+//                                 break;
+//                             }
+//                             continue;
+//                         }
+//                     }
+//                     if config.number_mode == NumberMode::AllLine {
+//                         state.line_number.next_line_num();
+//                         writer.write(state.line_number.get_line_num())?;
+//                         writer.write_byte(b'\t')?;
+//                     }
+//                 }
+
+//                 if config.show_ends {
+//                     if state.pre_carriage_return {
+//                         writer.write(b"^M")?;
+//                         state.pre_carriage_return = false;
+//                     }
+//                     writer.write_byte(b'$')?;
+//                 }
+//                 writer.write_byte(b'\n')?;
+//             }
+//             if inloc == insize {
+//                 inloc += 1;
+//                 ch = b'\n';
+//                 continue;
+//             }
+//             ch = buffer[inloc];
+//             inloc += 1;
+//             if ch != b'\n' {
+//                 break;
+//             }
+//         }
+
+//         if state.pre_carriage_return {
+//             writer.write_byte(b'\r')?;
+//             state.pre_carriage_return = false;
+//         }
+
+//         if state.blank_lines >= 0 && config.number_mode != NumberMode::NonBlank {
+//             state.line_number.next_line_num();
+//             writer.write(state.line_number.get_line_num())?;
+//             writer.write_byte(b'\r')?;
+//         }
+
+//         if config.show_nonprinting {
+//             loop {
+//                 match ch {
+//                     b'\n' => {
+//                         state.blank_lines = -1;
+//                         break;
+//                     }
+//                     b'\t' => writer.write(config.tab_str())?,
+//                     32..=126 => writer.write(&[ch])?,
+//                     127 => writer.write(&[b'^', b'?'])?,
+//                     128..=159 => writer.write(&[b'M', b'-', b'^', ch - 64])?,
+//                     160..=254 => writer.write(&[b'M', b'-', ch - 128])?,
+//                     255.. => writer.write(&[b'M', b'-', b'^', b'?'])?,
+//                     _ => writer.write(&[b'^', ch + 64])?,
+//                 }
+//                 if inloc == insize {
+//                     inloc += 1;
+//                     ch = b'\n';
+//                 } else {
+//                     ch = buffer[inloc];
+//                     inloc += 1;
+//                 }
+//             }
+//         } else {
+//             loop {
+//                 match ch {
+//                     b'\t' => {
+//                         writer.write(config.tab_str())?;
+//                     }
+//                     b'\n' => {
+//                         state.blank_lines = -1;
+//                         break;
+//                     }
+//                     b'\r' if config.show_ends => {
+//                         if inloc == insize {
+//                             state.pre_carriage_return = true;
+//                         } else if buffer[inloc] == b'\n' {
+//                             writer.write(b"^M")?;
+//                         } else {
+//                             writer.write_byte(b'\r')?;
+//                         }
+//                     }
+//                     _ => {
+//                         writer.write_byte(ch)?;
+//                     }
+//                 }
+
+//                 if inloc == insize {
+//                     inloc += 1;
+//                     ch = b'\n';
+//                 } else {
+//                     ch = buffer[inloc];
+//                     inloc += 1;
+//                 }
+//             }
+//         }
+//     }
+// }
 
 /// Processes the input and writes it to the output with formatting
 fn real_write(
@@ -393,11 +728,12 @@ fn real_write(
     state: &mut OutState,
     bufsize: usize,
 ) -> Result<(), Error> {
-    let mut stdout = io::stdout();
     let mut buffer: Vec<u8> = vec![0; bufsize];
+    let mut writer = BufferedWriter::new(io::stdout());
 
     loop {
         let byte_read = reader.read(&mut buffer)?;
+
         if byte_read == 0 {
             break;
         }
@@ -407,11 +743,12 @@ fn real_write(
             if buffer[offset] == b'\n' {
                 if !(state.new_line && config.squeeze_blank && state.has_blank_line) {
                     if state.new_line && config.number_mode == NumberMode::AllLine {
-                        write!(stdout, "{0:6}\t", state.line)?;
-                        state.line += 1;
+                        state.line_number.next_line_num();
+                        writer.write(state.line_number.get_line_num())?;
+                        writer.write_byte(b'\t')?;
                     }
 
-                    write_end(&mut stdout, config, state)?;
+                    write_end(&mut writer, config, state)?;
                     state.has_blank_line = state.new_line;
                 }
                 offset += 1;
@@ -420,32 +757,30 @@ fn real_write(
             }
             state.has_blank_line = false;
             if state.pre_carriage_return {
-                write!(stdout, "\r")?;
+                writer.write_byte(b'\r')?;
                 state.pre_carriage_return = false;
                 state.new_line = false;
             }
-            if state.new_line
-                && (config.number_mode == NumberMode::AllLine
-                    || config.number_mode == NumberMode::NonBlank && buffer[offset] != b'\n')
-            {
+            if state.new_line && (config.number_mode != NumberMode::None) {
                 // print line number
-                write!(stdout, "{0:6}\t", state.line)?;
-                state.line += 1;
+                state.line_number.next_line_num();
+                writer.write(state.line_number.get_line_num())?;
+                writer.write_byte(b'\t')?;
             }
 
             // write line
             let len = {
                 let in_buf: &[u8] = &buffer[offset..byte_read];
                 match (config.show_nonprinting, config.show_tabs) {
-                    (true, _) => write_line_nonprinting(&mut stdout, in_buf, config),
-                    (false, true) => write_line_show_tab(&mut stdout, in_buf, config),
+                    (true, _) => write_line_nonprinting(&mut writer, in_buf, config),
+                    (false, true) => write_line_show_tab(&mut writer, in_buf, config),
                     _ => match in_buf.iter().position(|c| *c == b'\n' || *c == b'\r') {
                         Some(p) => {
-                            stdout.write_all(&in_buf[..p])?;
+                            writer.write(&in_buf[..p])?;
                             Ok(p)
                         }
                         None => {
-                            stdout.write_all(in_buf)?;
+                            writer.write(in_buf)?;
                             Ok(in_buf.len())
                         }
                     },
@@ -460,7 +795,7 @@ fn real_write(
                 break;
             }
             if buffer[offset + len] == b'\n' {
-                write_end(&mut stdout, config, state)?;
+                write_end(&mut writer, config, state)?;
                 state.has_blank_line = state.new_line;
                 state.new_line = true;
             } else if buffer[offset + len] == b'\r' {
@@ -471,22 +806,27 @@ fn real_write(
             offset += len + 1;
         }
     }
+    writer.flush()?;
     Ok(())
 }
 
 /// Writes the end-of-line characters
-fn write_end<W: Write>(writer: &mut W, config: &Config, state: &mut OutState) -> Result<(), Error> {
+fn write_end<W: Write>(
+    writer: &mut BufferedWriter<W>,
+    config: &Config,
+    state: &mut OutState,
+) -> Result<(), Error> {
     if state.pre_carriage_return && config.show_ends {
-        writer.write_all(b"^M")?;
+        writer.write(b"^M")?;
     }
     state.pre_carriage_return = false;
-    writer.write_all(config.end_str())?;
+    writer.write(config.end_str())?;
     Ok(())
 }
 
 /// Writes a line with non-printing characters
 fn write_line_nonprinting<W: Write>(
-    writer: &mut W,
+    writer: &mut BufferedWriter<W>,
     in_buf: &[u8],
     config: &Config,
 ) -> Result<usize, Error> {
@@ -496,13 +836,13 @@ fn write_line_nonprinting<W: Write>(
             break;
         }
         match byte {
-            b'\t' => writer.write_all(config.tab_str())?,
-            32..=126 => writer.write_all(&[byte])?,
-            127 => writer.write_all(&[b'^', b'?'])?,
-            128..=159 => writer.write_all(&[b'M', b'-', b'^', byte - 64])?,
-            160..=254 => writer.write_all(&[b'M', b'-', byte - 128])?,
-            255.. => writer.write_all(&[b'M', b'-', b'^', b'?'])?,
-            _ => writer.write_all(&[b'^', byte + 64])?,
+            b'\t' => writer.write(config.tab_str())?,
+            32..=126 => writer.write(&[byte])?,
+            127 => writer.write(&[b'^', b'?'])?,
+            128..=159 => writer.write(&[b'M', b'-', b'^', byte - 64])?,
+            160..=254 => writer.write(&[b'M', b'-', byte - 128])?,
+            255.. => writer.write(&[b'M', b'-', b'^', b'?'])?,
+            _ => writer.write(&[b'^', byte + 64])?,
         };
         pos += 1;
     }
@@ -511,7 +851,7 @@ fn write_line_nonprinting<W: Write>(
 
 /// Writes a line with tab characters shown
 fn write_line_show_tab<W: Write>(
-    writer: &mut W,
+    writer: &mut BufferedWriter<W>,
     mut in_buf: &[u8],
     config: &Config,
 ) -> Result<usize, Error> {
@@ -523,17 +863,17 @@ fn write_line_show_tab<W: Write>(
         {
             Some(p) => {
                 if in_buf[p] == b'\t' {
-                    writer.write_all(&in_buf[..p])?;
-                    writer.write_all(config.tab_str())?;
+                    writer.write(&in_buf[..p])?;
+                    writer.write(config.tab_str())?;
                     in_buf = &in_buf[p + 1..];
                     pos += p + 1;
                 } else {
-                    writer.write_all(&in_buf[..p])?;
+                    writer.write(&in_buf[..p])?;
                     return Ok(pos + p);
                 }
             }
             None => {
-                writer.write_all(in_buf)?;
+                writer.write(in_buf)?;
                 return Ok(pos + in_buf.len());
             }
         }

@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "3.2.0", features = ["cargo"] }
 nix  = { version = "0.27.1", features = ["fs"] }
+lazy_static = { version = "1.4" }
 
 [[bin]]
 name = "rat"
