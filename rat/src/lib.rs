@@ -6,25 +6,23 @@
 
 mod io_util;
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command, Error};
-use io_util::{io_blksize, BufferedWriter};
+use crossbeam::channel;
+use io_util::{io_blksize, is_multithread, BufferedWriter};
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc::{lseek, O_APPEND, SEEK_CUR};
 use nix::sys::stat::fstat;
-use std::cell::UnsafeCell;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 use std::thread;
 use std::{
     fs::File,
     io::{self, Read, Write},
+    mem,
     path::Path,
 };
 
 const ABOUT: &str = "rat - concatenate files and print on the standard output";
 
 const LINE_COUNTER_BUF_LEN: usize = 20;
-
-const BUFFER_POOL_SIZE: usize = 10;
 
 #[derive(PartialEq, Eq)]
 /// Enum representing the mode for numbering lines
@@ -438,133 +436,45 @@ pub fn rat_process(config: &Config) -> i32 {
 /// Writes the input directly to the output using a single thread
 fn easy_write_single_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
-    let mut writer = BufferedWriter::new(io::stdout());
+    let mut writer = io::stdout();
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        writer.write(&buffer[..bytes_read])?;
+        writer.write_all(&buffer[..bytes_read])?;
     }
     Ok(())
 }
 
-#[derive(Clone)]
-struct Buffer {
-    buffer: Vec<u8>,
-    size: usize,
-}
-
-impl Buffer {
-    fn new(size: usize) -> Self {
-        Buffer {
-            buffer: vec![0; size],
-            size: 0,
-        }
-    }
-}
-
-///
-struct BufferPoolState {
-    head: usize,
-    tail: usize,
-    finish: bool,
-}
-
-impl BufferPoolState {
-    fn new() -> Self {
-        BufferPoolState {
-            head: 0,
-            tail: 0,
-            finish: false,
-        }
-    }
-
-    fn next_head(&mut self) {
-        self.head = (self.head + 1) % BUFFER_POOL_SIZE;
-    }
-
-    fn next_tail(&mut self) {
-        self.tail = (self.tail + 1) % BUFFER_POOL_SIZE;
-    }
-
-    fn is_full(&self) -> bool {
-        (self.head + 1) % BUFFER_POOL_SIZE == self.tail
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    fn set_finish(&mut self) {
-        self.finish = true;
-    }
-
-    fn is_finish(&self) -> bool {
-        self.finish
-    }
-
-    fn get_head(&self) -> usize {
-        self.head
-    }
-    fn get_tail(&self) -> usize {
-        self.tail
-    }
-}
-
-///
-struct BufferPool {
-    buffers: UnsafeCell<Vec<Buffer>>,
-    state: UnsafeCell<BufferPoolState>,
-}
-
-unsafe impl Send for BufferPool {}
-unsafe impl Sync for BufferPool {}
-
 /// Writes the input directly to the output using multiple threads
 fn easy_write_multi_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
-    let buffer_pool = Arc::new(BufferPool {
-        buffers: UnsafeCell::new(vec![Buffer::new(bufsize); BUFFER_POOL_SIZE]),
-        state: UnsafeCell::new(BufferPoolState::new()),
-    });
+    let (sender, receiver) = channel::unbounded::<(Vec<u8>, usize)>();
 
-    let r_bp = buffer_pool.clone();
     let r_handle = thread::spawn(move || -> Result<(), Error> {
-        let buffers = unsafe { &mut *r_bp.buffers.get() };
-        let r_state = unsafe { &mut *r_bp.state.get() };
         loop {
-            while r_state.is_full() {
-                thread::yield_now();
-            }
-            let bytes_read = reader.read(&mut buffers[r_state.get_head()].buffer)?;
+            let mut buffer: Vec<u8> = vec![0; bufsize];
+            let bytes_read = reader.read(&mut buffer)?;
+            sender.send((mem::take(&mut buffer), bytes_read)).unwrap();
             if bytes_read == 0 {
                 break;
             }
-            buffers[r_state.get_head()].size = bytes_read;
-            r_state.next_head();
         }
-        r_state.set_finish();
         Ok(())
     });
 
-    let w_bp = buffer_pool;
     let w_handle = thread::spawn(move || -> Result<(), Error> {
-        let mut writer = BufferedWriter::new(io::stdout());
-        let buffers = unsafe { &mut *w_bp.buffers.get() };
-        let w_state = unsafe { &mut *w_bp.state.get() };
-
-        loop {
-            while w_state.is_empty() {
-                if w_state.is_finish() {
-                    return Ok(());
-                }
-                thread::yield_now();
+        let mut writer = BufferedWriter::new();
+        while let Ok((buffer, bytes_read)) = receiver.recv() {
+            if bytes_read == 0 {
+                break;
             }
-            let tb = &buffers[w_state.get_tail()];
-            writer.write_immediately(&tb.buffer[0..tb.size])?;
-            w_state.next_tail();
+            writer.write(&buffer[..bytes_read])?;
         }
+        writer.flush()?;
+        writer.wait()?;
+        Ok(())
     });
 
     r_handle.join().unwrap().unwrap();
@@ -574,152 +484,12 @@ fn easy_write_multi_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> 
 
 /// Writes the input directly to the output
 fn easy_write(reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
-    let available_cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    if available_cores == 1 {
-        easy_write_single_thread(reader, bufsize)
-    } else {
+    if is_multithread() {
         easy_write_multi_thread(reader, bufsize)
+    } else {
+        easy_write_single_thread(reader, bufsize)
     }
 }
-
-// fn real_write(
-//     mut reader: Box<dyn Read>,
-//     config: &Config,
-//     state: &mut OutState,
-//     bufsize: usize,
-// ) -> Result<(), Error> {
-//     let mut buffer: Vec<u8> = vec![0; bufsize];
-//     let mut writer = BufferedWriter::new(io::stdout());
-//     let mut inloc = 1;
-//     let mut insize = 0;
-//     let mut ch: u8 = 0;
-//     loop {
-//         loop {
-//             if inloc > insize {
-//                 insize = reader.read(&mut buffer)?;
-//                 if insize == 0 {
-//                     writer.flush()?;
-//                     return Ok(()); // EOF
-//                 }
-//                 inloc = 0;
-//             } else {
-//                 state.blank_lines += 1;
-//                 if state.blank_lines > 0 {
-//                     if state.blank_lines >= 2 {
-//                         state.blank_lines = 2;
-//                         if config.squeeze_blank {
-//                             if inloc == insize {
-//                                 inloc += 1;
-//                                 ch = b'\n';
-//                                 continue;
-//                             }
-//                             ch = buffer[inloc];
-//                             inloc += 1;
-//                             if ch != b'\n' {
-//                                 break;
-//                             }
-//                             continue;
-//                         }
-//                     }
-//                     if config.number_mode == NumberMode::AllLine {
-//                         state.line_number.next_line_num();
-//                         writer.write(state.line_number.get_line_num())?;
-//                         writer.write_byte(b'\t')?;
-//                     }
-//                 }
-
-//                 if config.show_ends {
-//                     if state.pre_carriage_return {
-//                         writer.write(b"^M")?;
-//                         state.pre_carriage_return = false;
-//                     }
-//                     writer.write_byte(b'$')?;
-//                 }
-//                 writer.write_byte(b'\n')?;
-//             }
-//             if inloc == insize {
-//                 inloc += 1;
-//                 ch = b'\n';
-//                 continue;
-//             }
-//             ch = buffer[inloc];
-//             inloc += 1;
-//             if ch != b'\n' {
-//                 break;
-//             }
-//         }
-
-//         if state.pre_carriage_return {
-//             writer.write_byte(b'\r')?;
-//             state.pre_carriage_return = false;
-//         }
-
-//         if state.blank_lines >= 0 && config.number_mode != NumberMode::NonBlank {
-//             state.line_number.next_line_num();
-//             writer.write(state.line_number.get_line_num())?;
-//             writer.write_byte(b'\r')?;
-//         }
-
-//         if config.show_nonprinting {
-//             loop {
-//                 match ch {
-//                     b'\n' => {
-//                         state.blank_lines = -1;
-//                         break;
-//                     }
-//                     b'\t' => writer.write(config.tab_str())?,
-//                     32..=126 => writer.write(&[ch])?,
-//                     127 => writer.write(&[b'^', b'?'])?,
-//                     128..=159 => writer.write(&[b'M', b'-', b'^', ch - 64])?,
-//                     160..=254 => writer.write(&[b'M', b'-', ch - 128])?,
-//                     255.. => writer.write(&[b'M', b'-', b'^', b'?'])?,
-//                     _ => writer.write(&[b'^', ch + 64])?,
-//                 }
-//                 if inloc == insize {
-//                     inloc += 1;
-//                     ch = b'\n';
-//                 } else {
-//                     ch = buffer[inloc];
-//                     inloc += 1;
-//                 }
-//             }
-//         } else {
-//             loop {
-//                 match ch {
-//                     b'\t' => {
-//                         writer.write(config.tab_str())?;
-//                     }
-//                     b'\n' => {
-//                         state.blank_lines = -1;
-//                         break;
-//                     }
-//                     b'\r' if config.show_ends => {
-//                         if inloc == insize {
-//                             state.pre_carriage_return = true;
-//                         } else if buffer[inloc] == b'\n' {
-//                             writer.write(b"^M")?;
-//                         } else {
-//                             writer.write_byte(b'\r')?;
-//                         }
-//                     }
-//                     _ => {
-//                         writer.write_byte(ch)?;
-//                     }
-//                 }
-
-//                 if inloc == insize {
-//                     inloc += 1;
-//                     ch = b'\n';
-//                 } else {
-//                     ch = buffer[inloc];
-//                     inloc += 1;
-//                 }
-//             }
-//         }
-//     }
-// }
 
 /// Processes the input and writes it to the output with formatting
 fn real_write(
@@ -729,7 +499,7 @@ fn real_write(
     bufsize: usize,
 ) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
-    let mut writer = BufferedWriter::new(io::stdout());
+    let mut writer = BufferedWriter::new();
 
     loop {
         let byte_read = reader.read(&mut buffer)?;
@@ -812,12 +582,13 @@ fn real_write(
         }
     }
     writer.flush()?;
+    writer.wait()?;
     Ok(())
 }
 
 /// Writes the end-of-line characters
-fn write_end<W: Write>(
-    writer: &mut BufferedWriter<W>,
+fn write_end(
+    writer: &mut BufferedWriter,
     config: &Config,
     state: &mut OutState,
 ) -> Result<(), Error> {
@@ -830,8 +601,8 @@ fn write_end<W: Write>(
 }
 
 /// Writes a line with non-printing characters
-fn write_line_nonprinting<W: Write>(
-    writer: &mut BufferedWriter<W>,
+fn write_line_nonprinting(
+    writer: &mut BufferedWriter,
     in_buf: &[u8],
     config: &Config,
 ) -> Result<usize, Error> {
@@ -855,8 +626,8 @@ fn write_line_nonprinting<W: Write>(
 }
 
 /// Writes a line with tab characters shown
-fn write_line_show_tab<W: Write>(
-    writer: &mut BufferedWriter<W>,
+fn write_line_show_tab(
+    writer: &mut BufferedWriter,
     mut in_buf: &[u8],
     config: &Config,
 ) -> Result<usize, Error> {

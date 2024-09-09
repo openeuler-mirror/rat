@@ -5,11 +5,24 @@
 // that was distributed with this source code.
 // Reference: https://github.com/coreutils/coreutils/blob/master/src/ioblksize.h
 
-use std::io::{self, Write};
+use crossbeam::channel::{self, Sender};
+use std::{
+    io::{self, Result, Write},
+    mem,
+    thread::{self, JoinHandle},
+};
 
 use nix::libc::{stat, S_IFMT, S_IFREG};
 
 pub const IO_BUFSIZE: usize = 256 * 1024;
+
+/// Determine if the program is running in a multithreaded environment
+pub fn is_multithread() -> bool {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        > 1
+}
 
 /// Determine the optimal block size for I/O operations
 pub fn io_blksize(stat: &stat) -> usize {
@@ -34,23 +47,44 @@ pub fn io_blksize(stat: &stat) -> usize {
     blksize
 }
 
-pub struct BufferedWriter<W: Write> {
-    writer: W,
+/// A buffered writer that can be used in a multithreaded environment
+pub struct BufferedWriterMultiThread {
     buffer: Vec<u8>,
+    max_size: usize,
+    sender: Sender<Vec<u8>>,
+    handle: Option<JoinHandle<Result<()>>>,
 }
 
-impl<W: Write> BufferedWriter<W> {
+impl BufferedWriterMultiThread {
     /// Create a new BufferedWriter
-    pub fn new(writer: W) -> Self {
+    pub fn new() -> Self {
+        let (sender, receiver) = channel::unbounded::<Vec<u8>>();
+
+        let handle = thread::spawn(move || -> Result<()> {
+            let mut writer = io::stdout();
+            while let Ok(buffer) = receiver.recv() {
+                if buffer.is_empty() {
+                    break;
+                }
+                writer.write_all(&buffer)?;
+            }
+            Ok(())
+        });
+
         Self {
-            writer,
             buffer: Vec::with_capacity(IO_BUFSIZE),
+            max_size: IO_BUFSIZE,
+            sender,
+            handle: Some(handle),
         }
     }
 
     /// Write data to the buffer
-    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        if self.buffer.len() + data.len() > self.buffer.capacity() {
+    pub fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        while self.buffer.len() + data.len() > self.max_size {
+            let process_len = self.max_size - self.buffer.len();
+            self.buffer.extend_from_slice(&data[..process_len]);
+            data = &data[process_len..];
             self.flush()?;
         }
         self.buffer.extend_from_slice(data);
@@ -58,7 +92,7 @@ impl<W: Write> BufferedWriter<W> {
     }
 
     /// Write a single byte to the buffer
-    pub fn write_byte(&mut self, byte: u8) -> io::Result<()> {
+    pub fn write_byte(&mut self, byte: u8) -> Result<()> {
         if self.buffer.len() == self.buffer.capacity() {
             self.flush()?;
         }
@@ -67,23 +101,119 @@ impl<W: Write> BufferedWriter<W> {
     }
 
     /// Flush the buffer to the writer
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
+        self.sender.send(mem::take(&mut self.buffer)).unwrap();
+        self.buffer = Vec::with_capacity(IO_BUFSIZE);
+        Ok(())
+    }
+
+    /// Wait for the writer to finish
+    pub fn wait(&mut self) -> Result<()> {
+        self.sender.send(Vec::new()).unwrap();
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A buffered writer that can be used in a single thread environment
+pub struct BufferedWriterSingleThread {
+    buffer: Vec<u8>,
+    max_size: usize,
+}
+
+impl BufferedWriterSingleThread {
+    /// Create a new BufferedWriter
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(IO_BUFSIZE),
+            max_size: IO_BUFSIZE,
+        }
+    }
+
+    /// Write data to the buffer
+    pub fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        while self.buffer.len() + data.len() > self.max_size {
+            let process_len = self.max_size - self.buffer.len();
+            self.buffer.extend_from_slice(&data[..process_len]);
+            data = &data[process_len..];
+            self.flush()?;
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Write a single byte to the buffer
+    pub fn write_byte(&mut self, byte: u8) -> Result<()> {
+        if self.buffer.len() == self.buffer.capacity() {
+            self.flush()?;
+        }
+        self.buffer.push(byte);
+        Ok(())
+    }
+
+    /// Flush the buffer to the writer
+    pub fn flush(&mut self) -> Result<()> {
         if !self.buffer.is_empty() {
-            self.writer.write_all(&self.buffer)?;
+            io::stdout().write_all(&self.buffer)?;
             self.buffer.clear();
         }
         Ok(())
     }
 
-    /// Write data immediately to the writer, bypassing the buffer
-    pub fn write_immediately(&mut self, data: &[u8]) -> io::Result<()> {
-        self.flush()?;
-        self.writer.write_all(data)
+    /// Single thread wait do nothing
+    pub fn wait(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
-impl<W: Write> Drop for BufferedWriter<W> {
-    fn drop(&mut self) {
-        let _ = self.flush();
+/// A buffered writer that can be used in a single or multithreaded environment
+pub enum BufferedWriter {
+    SingleThread(BufferedWriterSingleThread),
+    MultiThread(BufferedWriterMultiThread),
+}
+
+impl BufferedWriter {
+    /// Create a new BufferedWriter
+    pub fn new() -> Self {
+        if is_multithread() {
+            BufferedWriter::MultiThread(BufferedWriterMultiThread::new())
+        } else {
+            BufferedWriter::SingleThread(BufferedWriterSingleThread::new())
+        }
+    }
+
+    /// Write data to the buffer
+    pub fn write(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            BufferedWriter::SingleThread(writer) => writer.write(data),
+            BufferedWriter::MultiThread(writer) => writer.write(data),
+        }
+    }
+
+    /// Write a single byte to the buffer
+    pub fn write_byte(&mut self, byte: u8) -> Result<()> {
+        match self {
+            BufferedWriter::SingleThread(writer) => writer.write_byte(byte),
+            BufferedWriter::MultiThread(writer) => writer.write_byte(byte),
+        }
+    }
+
+    /// Flush the buffer to the writer
+    pub fn flush(&mut self) -> Result<()> {
+        match self {
+            BufferedWriter::SingleThread(writer) => writer.flush(),
+            BufferedWriter::MultiThread(writer) => writer.flush(),
+        }
+    }
+
+    /// Wait for the writer to finish
+    pub fn wait(&mut self) -> Result<()> {
+        match self {
+            BufferedWriter::SingleThread(writer) => writer.wait(),
+            BufferedWriter::MultiThread(writer) => writer.wait(),
+        }
     }
 }
