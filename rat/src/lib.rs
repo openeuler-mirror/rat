@@ -6,17 +6,14 @@
 
 mod io_util;
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command, Error};
-use crossbeam::channel;
-use io_util::{io_blksize, is_multithread, BufferedWriter};
+use io_util::{io_blksize, BufferedWriter};
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc::{lseek, O_APPEND, SEEK_CUR};
 use nix::sys::stat::fstat;
 use std::os::unix::io::AsRawFd;
-use std::thread;
 use std::{
     fs::File,
-    io::{self, Read, Write},
-    mem,
+    io::{self, Read},
     path::Path,
 };
 
@@ -433,62 +430,21 @@ pub fn rat_process(config: &Config) -> i32 {
     exit_status
 }
 
-/// Writes the input directly to the output using a single thread
-fn easy_write_single_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
+/// Writes the input directly to the output
+fn easy_write(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
-    let mut writer = io::stdout();
+    let mut writer = BufferedWriter::new();
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        writer.write_all(&buffer[..bytes_read])?;
+        writer.write(&buffer[..bytes_read])?;
     }
+    writer.flush()?;
+    writer.wait()?;
     Ok(())
-}
-
-/// Writes the input directly to the output using multiple threads
-fn easy_write_multi_thread(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
-    let (sender, receiver) = channel::unbounded::<(Vec<u8>, usize)>();
-
-    let r_handle = thread::spawn(move || -> Result<(), Error> {
-        loop {
-            let mut buffer: Vec<u8> = vec![0; bufsize];
-            let bytes_read = reader.read(&mut buffer)?;
-            sender.send((mem::take(&mut buffer), bytes_read)).unwrap();
-            if bytes_read == 0 {
-                break;
-            }
-        }
-        Ok(())
-    });
-
-    let w_handle = thread::spawn(move || -> Result<(), Error> {
-        let mut writer = BufferedWriter::new();
-        while let Ok((buffer, bytes_read)) = receiver.recv() {
-            if bytes_read == 0 {
-                break;
-            }
-            writer.write(&buffer[..bytes_read])?;
-        }
-        writer.flush()?;
-        writer.wait()?;
-        Ok(())
-    });
-
-    r_handle.join().unwrap().unwrap();
-    w_handle.join().unwrap().unwrap();
-    Ok(())
-}
-
-/// Writes the input directly to the output
-fn easy_write(reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
-    if is_multithread() {
-        easy_write_multi_thread(reader, bufsize)
-    } else {
-        easy_write_single_thread(reader, bufsize)
-    }
 }
 
 /// Processes the input and writes it to the output with formatting
@@ -603,26 +559,34 @@ fn write_end(
 /// Writes a line with non-printing characters
 fn write_line_nonprinting(
     writer: &mut BufferedWriter,
-    in_buf: &[u8],
+    mut in_buf: &[u8],
     config: &Config,
 ) -> Result<usize, Error> {
     let mut pos = 0;
-    for byte in in_buf.iter().copied() {
-        if byte == b'\n' {
-            break;
+    loop {
+        match in_buf.iter().position(|c| *c < 32 || *c > 126) {
+            Some(p) => {
+                writer.write(&in_buf[..p])?;
+                let byte = in_buf[p];
+                match byte {
+                    b'\n' => return Ok(pos + p),
+                    b'\t' => writer.write(config.tab_str())?,
+                    32..=126 => writer.write(&[byte])?,
+                    127 => writer.write(&[b'^', b'?'])?,
+                    128..=159 => writer.write(&[b'M', b'-', b'^', byte - 64])?,
+                    160..=254 => writer.write(&[b'M', b'-', byte - 128])?,
+                    255.. => writer.write(&[b'M', b'-', b'^', b'?'])?,
+                    _ => writer.write(&[b'^', byte + 64])?,
+                };
+                pos += p + 1;
+                in_buf = &in_buf[p + 1..];
+            }
+            None => {
+                writer.write(in_buf)?;
+                return Ok(pos + in_buf.len());
+            }
         }
-        match byte {
-            b'\t' => writer.write(config.tab_str())?,
-            32..=126 => writer.write(&[byte])?,
-            127 => writer.write(&[b'^', b'?'])?,
-            128..=159 => writer.write(&[b'M', b'-', b'^', byte - 64])?,
-            160..=254 => writer.write(&[b'M', b'-', byte - 128])?,
-            255.. => writer.write(&[b'M', b'-', b'^', b'?'])?,
-            _ => writer.write(&[b'^', byte + 64])?,
-        };
-        pos += 1;
     }
-    Ok(pos)
 }
 
 /// Writes a line with tab characters shown
