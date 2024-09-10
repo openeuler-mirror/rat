@@ -10,6 +10,7 @@ use io_util::{io_blksize, BufferedWriter};
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc::{lseek, O_APPEND, SEEK_CUR};
 use nix::sys::stat::fstat;
+use nix::unistd::isatty;
 use std::os::unix::io::AsRawFd;
 use std::{
     fs::File,
@@ -330,11 +331,12 @@ fn rat_handle(
     state: &mut OutState,
     config: &Config,
     bufsize: usize,
+    is_interactive: bool,
 ) -> Result<(), Error> {
     if config.can_easy_write() {
-        easy_write(reader, bufsize)?;
+        easy_write(reader, bufsize, is_interactive)?;
     } else {
-        real_write(reader, config, state, bufsize)?;
+        real_write(reader, config, state, bufsize, is_interactive)?;
     }
     Ok(())
 }
@@ -342,6 +344,7 @@ fn rat_handle(
 struct InputState {
     reader: Box<dyn Read + Send>,
     bufsize: usize,
+    is_interactive: bool,
 }
 
 /// Opens a file and returns a reader
@@ -354,6 +357,7 @@ fn open_file(file: &str) -> Option<InputState> {
         InputType::Stdin => Some(InputState {
             reader: Box::new(io::stdin()),
             bufsize: 10240,
+            is_interactive: isatty(io::stdin().as_raw_fd()).unwrap_or(false),
         }),
         InputType::File => {
             if !Path::new(file).exists() {
@@ -388,6 +392,7 @@ fn open_file(file: &str) -> Option<InputState> {
                         Some(InputState {
                             reader: Box::new(f),
                             bufsize: io_blksize(&in_stat),
+                            is_interactive: false,
                         })
                     }
                     _ => None,
@@ -415,11 +420,16 @@ pub fn rat_process(config: &Config) -> i32 {
 
     for file in &config.files {
         if let Some(in_stat) = open_file(file) {
-            rat_handle(in_stat.reader, &mut out_state, config, in_stat.bufsize).unwrap_or_else(
-                |_| {
-                    exit_status = 1;
-                },
-            );
+            rat_handle(
+                in_stat.reader,
+                &mut out_state,
+                config,
+                in_stat.bufsize,
+                in_stat.is_interactive,
+            )
+            .unwrap_or_else(|_| {
+                exit_status = 1;
+            });
         } else {
             exit_status = 1;
         }
@@ -431,7 +441,11 @@ pub fn rat_process(config: &Config) -> i32 {
 }
 
 /// Writes the input directly to the output
-fn easy_write(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Error> {
+fn easy_write(
+    mut reader: Box<dyn Read + Send>,
+    bufsize: usize,
+    is_interactive: bool,
+) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
     let mut writer = BufferedWriter::new();
 
@@ -441,6 +455,9 @@ fn easy_write(mut reader: Box<dyn Read + Send>, bufsize: usize) -> Result<(), Er
             break;
         }
         writer.write(&buffer[..bytes_read])?;
+        if is_interactive {
+            writer.flush()?;
+        }
     }
     writer.flush()?;
     writer.wait()?;
@@ -453,6 +470,7 @@ fn real_write(
     config: &Config,
     state: &mut OutState,
     bufsize: usize,
+    is_interactive: bool,
 ) -> Result<(), Error> {
     let mut buffer: Vec<u8> = vec![0; bufsize];
     let mut writer = BufferedWriter::new();
@@ -474,7 +492,7 @@ fn real_write(
                         writer.write_byte(b'\t')?;
                     }
 
-                    write_end(&mut writer, config, state)?;
+                    write_end(&mut writer, config, state, is_interactive)?;
                     state.has_blank_line = state.new_line;
                 }
                 offset += 1;
@@ -523,7 +541,7 @@ fn real_write(
 
             match buffer[offset + len] {
                 b'\n' => {
-                    write_end(&mut writer, config, state)?;
+                    write_end(&mut writer, config, state, is_interactive)?;
                     state.has_blank_line = state.new_line;
                     state.new_line = true;
                 }
@@ -547,12 +565,16 @@ fn write_end(
     writer: &mut BufferedWriter,
     config: &Config,
     state: &mut OutState,
+    is_interactive: bool,
 ) -> Result<(), Error> {
     if state.pre_carriage_return && config.show_ends {
         writer.write(b"^M")?;
     }
     state.pre_carriage_return = false;
     writer.write(config.end_str())?;
+    if is_interactive {
+        writer.flush()?;
+    }
     Ok(())
 }
 
