@@ -1,18 +1,29 @@
 #!/bin/bash
 
-# Define some colors using ANSI escape codes
+# =============================================================================
+# performance_test_multithreaded.sh
+# =============================================================================
+# 
+# This script measures and compares the performance of the `rat` and `cat` 
+# commands in a multi-threaded environment. It runs both commands with the 
+# same set of arguments, captures their execution times, and compares their 
+# outputs to ensure correctness.
+#
+
+# Define some colors using ANSI escape codes for output formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
+# Function to generate a random file of specified size
 generate_random_file() {
     filename=$1
     size=$2
     base64 /dev/urandom | head -c $size > $filename
 }
 
-
+# Function to measure the execution time and output of a command
 measure_time_and_output() {
     params=("$@")
     output_file=$1
@@ -39,7 +50,7 @@ compare_rat_and_cat() {
     # Store all passed arguments to be used by the programs
     args=("$@")
 
-    # Define temporary files
+    # Define temporary files for storing outputs and execution times
     rat_output_file="rat_output_file"
     cat_output_file="cat_output_file"
     rat_time_file=$(mktemp)
@@ -95,9 +106,12 @@ compare_rat_and_cat() {
     return 0
 }
 
-generate_random_file rf_256KB $(expr 1024)
+# Generate random files of different sizes for testing
+generate_random_file rf_256KB $(expr 256 \* 1024)
 generate_random_file rf_32MB $(expr 32 \* 1024 \* 1024)
 generate_random_file rf_256MB $(expr 256 \* 1024 \* 1024)
+
+# Run tests with different arguments and file sizes
 
 # Simple cat
 # Small file
@@ -131,7 +145,7 @@ compare_rat_and_cat rf_32MB -v
 # Large file
 compare_rat_and_cat rf_256MB -v
 
-# With arguments -T
+# With argument -T
 # Small file
 compare_rat_and_cat rf_256KB -T
 # Medium file
@@ -139,7 +153,7 @@ compare_rat_and_cat rf_32MB -T
 # Large file
 compare_rat_and_cat rf_256MB -T
 
-# With arguments -A
+# With argument -A
 # Small file
 compare_rat_and_cat rf_256KB -A
 # Medium file
@@ -147,4 +161,5 @@ compare_rat_and_cat rf_32MB -A
 # Large file
 compare_rat_and_cat rf_256MB -A
 
+# Clean up generated files
 rm rf_256KB rf_32MB rf_256MB
