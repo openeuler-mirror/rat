@@ -567,10 +567,15 @@ fn write_end(
     state: &mut OutState,
     is_interactive: bool,
 ) -> Result<(), Error> {
-    if state.pre_carriage_return && config.show_ends {
-        writer.write(b"^M")?;
+    if state.pre_carriage_return {
+        if config.show_ends {
+            writer.write(b"^M")?;
+        } else {
+            writer.write(b"\r")?;
+        }
+        state.pre_carriage_return = false;
     }
-    state.pre_carriage_return = false;
+
     writer.write(config.end_str())?;
     if is_interactive {
         writer.flush()?;
