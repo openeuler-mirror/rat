@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.2.0", features = ["cargo"] }
-nix  = { version = "0.27.1", features = ["fs"] }
+nix  = { version = "0.27.1", features = ["fs", "zerocopy"] }
 lazy_static = { version = "1.4" }
 crossbeam = { version = "0.8.4" }
 

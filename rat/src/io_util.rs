@@ -6,13 +6,15 @@
 // Reference: https://github.com/coreutils/coreutils/blob/master/src/ioblksize.h
 
 use crossbeam::channel::{self, Sender};
+use nix::fcntl::{splice, SpliceFFlags};
+use nix::libc::{stat, S_IFMT, S_IFREG};
+use std::os::unix::io::RawFd;
+use std::thread;
 use std::{
     io::{self, Result, Write},
     mem,
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
 };
-
-use nix::libc::{stat, S_IFMT, S_IFREG};
 
 pub const IO_BUFSIZE: usize = 256 * 1024;
 
@@ -88,6 +90,9 @@ impl BufferedWriterMultiThread {
             self.flush()?;
         }
         self.buffer.extend_from_slice(data);
+        if self.buffer.len() == self.max_size {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -141,7 +146,12 @@ impl BufferedWriterSingleThread {
             data = &data[process_len..];
             self.flush()?;
         }
-        self.buffer.extend_from_slice(data);
+        if data.len() == self.max_size {
+            self.flush()?;
+            io::stdout().write_all(data)?;
+        } else {
+            self.buffer.extend_from_slice(data);
+        }
         Ok(())
     }
 
@@ -216,4 +226,64 @@ impl BufferedWriter {
             BufferedWriter::MultiThread(writer) => writer.wait(),
         }
     }
+}
+
+/// Copy file using splice syscall provided by linux
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn splice_copy(src_fd: RawFd, dst_fd: RawFd) -> Result<bool> {
+    let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
+
+    let buffer_size = IO_BUFSIZE;
+
+    loop {
+        let bytes_read = match splice(
+            src_fd,
+            None,
+            pipe_wr,
+            None,
+            buffer_size,
+            SpliceFFlags::empty(),
+        ) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => {
+                return Ok(false);
+            }
+        };
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        if splice_bytes(pipe_rd, dst_fd, bytes_read as usize).is_err() {
+            copy_bytes(pipe_rd, dst_fd, bytes_read as usize)?;
+            return Ok(false);
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn copy_bytes(read_fd: RawFd, write_fd: RawFd, size: usize) -> Result<()> {
+    let mut left = size;
+    let mut buf = [0; IO_BUFSIZE];
+    while left > 0 {
+        let read_bytes = nix::unistd::read(read_fd, &mut buf)?;
+        let mut write_bytes = 0;
+        while write_bytes < read_bytes {
+            let n = nix::unistd::write(write_fd, &buf[write_bytes..read_bytes])?;
+            write_bytes += n;
+        }
+        left -= read_bytes;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn splice_bytes(src_fd: RawFd, dst_fd: RawFd, len: usize) -> Result<()> {
+    let mut left = len;
+    while left != 0 {
+        let written = splice(src_fd, None, dst_fd, None, left, SpliceFFlags::empty())?;
+        left -= written;
+    }
+    Ok(())
 }

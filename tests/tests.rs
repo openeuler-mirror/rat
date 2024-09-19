@@ -22,30 +22,6 @@ fn run_and_compare_with_cat(test_args: &[&str]) {
     );
 }
 
-// fn run_and_timing_with_cat(test_args: &[&str]) {
-//     let start = Instant::now();
-//     let cat_res = Command::new(CAT_PATH)
-//         .args(test_args)
-//         .output()
-//         .expect("failed to execute process");
-//     let duration = start.elapsed();
-//     println!("Cat: {:?}", duration);
-
-//     let start = Instant::now();
-//     let rat_res = Command::new("cargo")
-//         .args(["run", "-p", "rat", "--"])
-//         .args(test_args)
-//         .output()
-//         .expect("failed to execute process");
-//     let duration = start.elapsed();
-//     println!("Rat: {:?}", duration);
-
-//     assert_eq!(
-//         String::from_utf8_lossy(&rat_res.stdout),
-//         String::from_utf8_lossy(&cat_res.stdout)
-//     );
-// }
-
 #[test]
 fn test_simple() {
     run_and_compare_with_cat(&[&format!("{}/{}", FIXTURES_PATH, "256.txt")]);
@@ -166,27 +142,3 @@ fn test_self() {
     print_to_file("y", "fy");
     print_to_file("xy", "fxy");
 }
-
-// #[test]
-// fn test_performance() {
-//     // generate a large file
-//     Command::new("bash")
-//         .arg("-c")
-//         .arg(format!(
-//             "base64 /dev/urandom | head -c 100MB > {}/largefile.txt",
-//             FIXTURES_PATH
-//         ))
-//         .output()
-//         .expect("failed to execute process");
-
-//     println!("Performance test");
-//     println!("-----------------");
-//     println!("largefile.txt");
-//     run_and_timing_with_cat(&[&format!("{}/{}", FIXTURES_PATH, "largefile.txt")]);
-//     println!("-----------------");
-//     println!("largefile.txt -n");
-//     run_and_timing_with_cat(&[&format!("{}/{}", FIXTURES_PATH, "largefile.txt"), "-n"]);
-//     println!("-----------------");
-//     println!("largefile.txt -A");
-//     run_and_timing_with_cat(&[&format!("{}/{}", FIXTURES_PATH, "largefile.txt"), "-A"]);
-// }
