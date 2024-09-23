@@ -23,12 +23,10 @@ compare_rat_and_cat() {
     echo -e "========================================${NC}"
 
     # Create temporary files to store the output
-    # tmp_rat=$(mktemp)
-    # tmp_cat=$(mktemp)
-    tmp_rat=a
-    tmp_cat=b
+    tmp_rat=$(mktemp)
+    tmp_cat=$(mktemp)
     # Execute rat program and store its output in the temporary file
-    target/debug/rat "${args[@]}" > "$tmp_rat"
+    target/release/rat "${args[@]}" > "$tmp_rat"
     exit_code_rat=$?  # Capture the exit code of the rat program
 
     # Execute cat program and store its output in the temporary file
@@ -67,7 +65,7 @@ compare_rat_and_cat random_file
 generate_random_file "random_file" $(expr 1024)
 compare_rat_and_cat random_file
 
-generate_random_file "random_file" $(expr 10 \* 1024 \* 1024)
+generate_random_file "random_file" $(expr 1024 \* 1024)
 compare_rat_and_cat random_file
 
 compare_rat_and_cat random_file -A
@@ -86,3 +84,26 @@ compare_rat_and_cat random_file -v -A -b -e -E -n
 compare_rat_and_cat random_file -s -t -T -v -A -b
 compare_rat_and_cat random_file -e -E -n -s -t -T -v
 compare_rat_and_cat random_file -A -b -e -E -n -s -t -T -v
+
+generate_random_file "random_file2" $(expr 32 \* 1024)
+compare_rat_and_cat random_file random_file2
+
+compare_rat_and_cat random_file random_file2 -A
+compare_rat_and_cat random_file random_file2 -b
+compare_rat_and_cat random_file random_file2 -e
+compare_rat_and_cat random_file random_file2 -E
+compare_rat_and_cat random_file random_file2 -n
+compare_rat_and_cat random_file random_file2 -s
+compare_rat_and_cat random_file random_file2 -t
+compare_rat_and_cat random_file random_file2 -T
+compare_rat_and_cat random_file random_file2 -v
+
+compare_rat_and_cat random_file random_file2 -A -b -e -E
+compare_rat_and_cat random_file random_file2 -n -s -t -T
+compare_rat_and_cat random_file random_file2 -v -A -b -e -E -n
+compare_rat_and_cat random_file random_file2 -s -t -T -v -A -b
+compare_rat_and_cat random_file random_file2 -e -E -n -s -t -T -v
+compare_rat_and_cat random_file random_file2 -A -b -e -E -n -s -t -T -v
+
+rm random_file random_file2
+echo -e "${GREEN}All tests pass!${NC}"

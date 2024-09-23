@@ -11,6 +11,7 @@ use nix::fcntl::{fcntl, FcntlArg};
 use nix::libc::{lseek, O_APPEND, SEEK_CUR};
 use nix::sys::stat::fstat;
 use nix::unistd::isatty;
+use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::{
     fs::File,
@@ -327,22 +328,21 @@ struct OutState {
 
 /// Handles the input and processes it based on the configuration
 fn rat_handle(
-    reader: Box<dyn Read + Send>,
+    input_state: &mut InputState,
     state: &mut OutState,
     config: &Config,
-    bufsize: usize,
-    is_interactive: bool,
 ) -> Result<(), Error> {
     if config.can_easy_write() {
-        easy_write(reader, bufsize, is_interactive)?;
+        easy_write(input_state)?;
     } else {
-        real_write(reader, config, state, bufsize, is_interactive)?;
+        real_write(input_state, config, state)?;
     }
     Ok(())
 }
 
 struct InputState {
     reader: Box<dyn Read + Send>,
+    fd: RawFd,
     bufsize: usize,
     is_interactive: bool,
 }
@@ -356,6 +356,7 @@ fn open_file(file: &str) -> Option<InputState> {
     match get_input_type(file) {
         InputType::Stdin => Some(InputState {
             reader: Box::new(io::stdin()),
+            fd: io::stdin().as_raw_fd(),
             bufsize: 10240,
             is_interactive: isatty(io::stdin().as_raw_fd()).unwrap_or(false),
         }),
@@ -389,8 +390,10 @@ fn open_file(file: &str) -> Option<InputState> {
                                 return None;
                             }
                         }
+                        let fd = f.as_raw_fd();
                         Some(InputState {
                             reader: Box::new(f),
+                            fd,
                             bufsize: io_blksize(&in_stat),
                             is_interactive: false,
                         })
@@ -410,24 +413,15 @@ fn open_file(file: &str) -> Option<InputState> {
 pub fn rat_process(config: &Config) -> i32 {
     let mut exit_status = 0;
     let mut out_state = OutState {
-        // line: 1,
         new_line: true,
         has_blank_line: false,
         pre_carriage_return: false,
-        // blank_lines: 0,
         line_number: LineNumber::new(LINE_COUNTER_BUF_LEN),
     };
 
     for file in &config.files {
-        if let Some(in_stat) = open_file(file) {
-            rat_handle(
-                in_stat.reader,
-                &mut out_state,
-                config,
-                in_stat.bufsize,
-                in_stat.is_interactive,
-            )
-            .unwrap_or_else(|_| {
+        if let Some(mut in_stat) = open_file(file) {
+            rat_handle(&mut in_stat, &mut out_state, config).unwrap_or_else(|_| {
                 exit_status = 1;
             });
         } else {
@@ -441,16 +435,23 @@ pub fn rat_process(config: &Config) -> i32 {
 }
 
 /// Writes the input directly to the output
-fn easy_write(
-    mut reader: Box<dyn Read + Send>,
-    bufsize: usize,
-    is_interactive: bool,
-) -> Result<(), Error> {
-    let mut buffer: Vec<u8> = vec![0; bufsize];
+fn easy_write(input_state: &mut InputState) -> Result<(), Error> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if !input_state.is_interactive
+            && !io_util::is_multithread()
+            && io_util::splice_copy(input_state.fd, io::stdout().as_raw_fd())?
+        {
+            return Ok(());
+        }
+    }
+
+    let mut buffer: Vec<u8> = vec![0; input_state.bufsize];
+    let is_interactive = input_state.is_interactive;
     let mut writer = BufferedWriter::new();
 
     loop {
-        let bytes_read = reader.read(&mut buffer)?;
+        let bytes_read = input_state.reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
@@ -466,12 +467,14 @@ fn easy_write(
 
 /// Processes the input and writes it to the output with formatting
 fn real_write(
-    mut reader: Box<dyn Read>,
+    input_state: &mut InputState,
     config: &Config,
     state: &mut OutState,
-    bufsize: usize,
-    is_interactive: bool,
 ) -> Result<(), Error> {
+    let bufsize = input_state.bufsize;
+    let reader = &mut input_state.reader;
+    let is_interactive = input_state.is_interactive;
+
     let mut buffer: Vec<u8> = vec![0; bufsize];
     let mut writer = BufferedWriter::new();
 
